@@ -19,7 +19,8 @@ limitations under the License.
 //
 // It should normally be used by importing it with a blank name, which
 // will cause it to register itself with the image package:
-//  import _ "github.com/lukegb/dds"
+//
+//	import _ "github.com/lukegb/dds"
 package dds
 
 import (
@@ -27,6 +28,8 @@ import (
 	"image"
 	"image/color"
 	"io"
+	"log"
+
 )
 
 func init() {
@@ -106,7 +109,7 @@ func Decode(r io.Reader) (image.Image, error) {
 	}
 
 	if h.pixelFormat.flags&pfFourCC == pfFourCC {
-		return nil, fmt.Errorf("image data is compressed with %v; compression is unsupported", h.pixelFormat.fourCC)
+		log.Printf("fourCC: %x", h.pixelFormat.fourCC)
 	}
 
 	if h.pixelFormat.flags != pfAlphaPixels|pfRGB {
