@@ -24,12 +24,11 @@ limitations under the License.
 package dds
 
 import (
+	"encoding/binary"
 	"fmt"
 	"image"
 	"image/color"
 	"io"
-	"log"
-
 )
 
 func init() {
@@ -109,7 +108,56 @@ func Decode(r io.Reader) (image.Image, error) {
 	}
 
 	if h.pixelFormat.flags&pfFourCC == pfFourCC {
-		log.Printf("fourCC: %x", h.pixelFormat.fourCC)
+		fourCC := uint32(861165636)
+		bytes := make([]byte, 4)
+		binary.LittleEndian.PutUint32(bytes, fourCC)
+
+		switch string(bytes) {
+		case "DXT1":
+			// ファイルから圧縮データを読み込む
+			compressedData := make([]byte, h.width*h.height)
+			if _, err := io.ReadFull(r, compressedData); err != nil {
+				return nil, fmt.Errorf("reading compressed image data: %v", err)
+			}
+
+			// DXT1デコード処理
+			img, err := decodeDXT1(compressedData, int(h.width), int(h.height))
+			if err != nil {
+				return nil, fmt.Errorf("decoding DXT1: %v", err)
+			}
+
+			return img, nil
+		case "DXT2", "DXT3":
+			// ファイルから圧縮データを読み込む
+			compressedData := make([]byte, h.width*h.height)
+			if _, err := io.ReadFull(r, compressedData); err != nil {
+				return nil, fmt.Errorf("reading compressed image data: %v", err)
+			}
+
+			// DXT3デコード処理
+			img, err := decodeDXT3(compressedData, int(h.width), int(h.height))
+			if err != nil {
+				return nil, fmt.Errorf("decoding DXT3: %v", err)
+			}
+
+			return img, nil
+		case "DXT4", "DXT5":
+			// ファイルから圧縮データを読み込む
+			compressedData := make([]byte, h.width*h.height)
+			if _, err := io.ReadFull(r, compressedData); err != nil {
+				return nil, fmt.Errorf("reading compressed image data: %v", err)
+			}
+
+			// DXT5デコード処理
+			img, err := decodeDXT5(compressedData, int(h.width), int(h.height))
+			if err != nil {
+				return nil, fmt.Errorf("decoding DXT5: %v", err)
+			}
+
+			return img, nil
+		default:
+			return nil, fmt.Errorf("unsupported FourCC %q", string(bytes))
+		}
 	}
 
 	if h.pixelFormat.flags != pfAlphaPixels|pfRGB {
@@ -135,4 +183,238 @@ func Decode(r io.Reader) (image.Image, error) {
 		bBit: lowestSetBit(h.pixelFormat.bBitMask),
 		aBit: lowestSetBit(h.pixelFormat.aBitMask),
 	}, nil
+}
+
+func rgb565ToRGBAColor(c uint16) color.RGBA {
+	r := uint8((c >> 11) & 0x1F << 3)
+	g := uint8((c >> 5) & 0x3F << 2)
+	b := uint8((c & 0x1F) << 3)
+	return color.RGBA{r, g, b, 255}
+}
+
+func interpolateColors(c0, c1 color.RGBA, w0, w1 int) color.RGBA {
+	r := (int(c0.R)*w0 + int(c1.R)*w1) / (w0 + w1)
+	g := (int(c0.G)*w0 + int(c1.G)*w1) / (w0 + w1)
+	b := (int(c0.B)*w0 + int(c1.B)*w1) / (w0 + w1)
+	return color.RGBA{uint8(r), uint8(g), uint8(b), 255}
+}
+
+// DXT1 ---------------------------------------------------------------------
+
+// decodeDXT1 decodes a DXT1 compressed byte slice into an RGBA image.
+func decodeDXT1(compressed []byte, width, height int) (*image.RGBA, error) {
+	decompressed := image.NewRGBA(image.Rect(0, 0, width, height))
+
+	blockWidth := (width + 3) / 4
+	blockHeight := (height + 3) / 4
+
+loop:
+	for blockY := 0; blockY < blockHeight; blockY++ {
+		for blockX := 0; blockX < blockWidth; blockX++ {
+			if len(compressed) < (blockY*blockWidth+blockX)*8+8 {
+				break loop
+			}
+
+			blockOffset := (blockY*blockWidth + blockX) * 8 // Each DXT1 block is 8 bytes
+			decodeBlockDXT1(compressed[blockOffset:blockOffset+8], decompressed, blockX*4, blockY*4, width)
+		}
+	}
+
+	return decompressed, nil
+}
+
+func decodeBlockDXT1(block []byte, img *image.RGBA, x, y, width int) {
+	c0 := binary.LittleEndian.Uint16(block[0:2])
+	c1 := binary.LittleEndian.Uint16(block[2:4])
+	colorData := binary.LittleEndian.Uint32(block[4:8])
+
+	colors := make([]color.RGBA, 4)
+	colors[0] = rgb565ToRGBAColor(c0)
+	colors[1] = rgb565ToRGBAColor(c1)
+	if c0 > c1 {
+		colors[2] = interpolateColors(colors[0], colors[1], 2, 1)
+		colors[3] = interpolateColors(colors[0], colors[1], 1, 2)
+	} else {
+		colors[2] = interpolateColors(colors[0], colors[1], 1, 1)
+		colors[3] = color.RGBA{0, 0, 0, 0}
+	}
+
+	for j := 0; j < 4; j++ {
+		for i := 0; i < 4; i++ {
+			px := x + i
+			py := y + j
+			if px >= width {
+				continue
+			}
+
+			colorIndex := (colorData >> uint((j*4+i)*2)) & 0x3
+			color := colors[colorIndex]
+
+			img.Set(px, py, color)
+		}
+	}
+}
+
+// DXT2, DXT3 ---------------------------------------------------------------
+
+// decodeDXT3 decodes a DXT3 (similar to DXT2 but without premultiplied alpha) compressed byte slice into an RGBA image.
+func decodeDXT3(compressed []byte, width, height int) (*image.RGBA, error) {
+	decompressed := image.NewRGBA(image.Rect(0, 0, width, height))
+
+	blockWidth := (width + 3) / 4
+	blockHeight := (height + 3) / 4
+
+loop:
+	for blockY := 0; blockY < blockHeight; blockY++ {
+		for blockX := 0; blockX < blockWidth; blockX++ {
+			if len(compressed) < (blockY*blockWidth+blockX)*16+16 {
+				break loop
+			}
+
+			blockOffset := (blockY*blockWidth + blockX) * 16 // Each DXT3 block is 16 bytes
+			decodeBlockDXT3(compressed[blockOffset:blockOffset+16], decompressed, blockX*4, blockY*4, width)
+		}
+	}
+
+	return decompressed, nil
+}
+
+func decodeBlockDXT3(block []byte, img *image.RGBA, x, y, width int) {
+	alphaData := binary.LittleEndian.Uint64(block[0:8])
+	c0 := binary.LittleEndian.Uint16(block[8:10])
+	c1 := binary.LittleEndian.Uint16(block[10:12])
+	colorData := binary.LittleEndian.Uint32(block[12:16])
+
+	colors := make([]color.RGBA, 4)
+	colors[0] = rgb565ToRGBAColor(c0)
+	colors[1] = rgb565ToRGBAColor(c1)
+	if c0 > c1 {
+		colors[2] = interpolateColors(colors[0], colors[1], 2, 1)
+		colors[3] = interpolateColors(colors[0], colors[1], 1, 2)
+	} else {
+		colors[2] = interpolateColors(colors[0], colors[1], 1, 1)
+		colors[3] = color.RGBA{0, 0, 0, 0}
+	}
+
+	for j := 0; j < 4; j++ {
+		for i := 0; i < 4; i++ {
+			px := x + i
+			py := y + j
+			if px >= width {
+				continue
+			}
+
+			alpha := uint8((alphaData>>uint(j*16+i*4))&0xF) * 17
+			colorIndex := (colorData >> uint((j*4+i)*2)) & 0x3
+			color := colors[colorIndex]
+			color.A = alpha
+
+			img.Set(px, py, color)
+		}
+	}
+}
+
+// DXT4, DXT5 ---------------------------------------------------------------
+
+// decodeDXT5 decodes a DXT5 compressed byte slice into an RGBA image.
+func decodeDXT5(compressed []byte, width, height int) (*image.RGBA, error) {
+	decompressed := image.NewRGBA(image.Rect(0, 0, width, height))
+
+	blockWidth := (width + 3) / 4
+	blockHeight := (height + 3) / 4
+
+loop:
+	for blockY := 0; blockY < blockHeight; blockY++ {
+		for blockX := 0; blockX < blockWidth; blockX++ {
+			if len(compressed) < (blockY*blockWidth+blockX)*16+16 {
+				break loop
+			}
+
+			blockOffset := (blockY*blockWidth + blockX) * 16 // Each DXT5 block is 16 bytes
+			decodeBlockDXT5(compressed[blockOffset:blockOffset+16], decompressed, blockX*4, blockY*4, width)
+		}
+	}
+
+	return decompressed, nil
+}
+
+func decodeBlockDXT5(block []byte, img *image.RGBA, x, y, width int) {
+	alpha0 := block[0]
+	alpha1 := block[1]
+	alphaData := binary.LittleEndian.Uint64(block[0:8]) >> 16
+	c0 := binary.LittleEndian.Uint16(block[8:10])
+	c1 := binary.LittleEndian.Uint16(block[10:12])
+	colorData := binary.LittleEndian.Uint32(block[12:16])
+
+	colors := make([]color.RGBA, 4)
+	colors[0] = rgb565ToRGBAColor(c0)
+	colors[1] = rgb565ToRGBAColor(c1)
+	if c0 > c1 {
+		colors[2] = interpolateColors(colors[0], colors[1], 2, 1)
+		colors[3] = interpolateColors(colors[0], colors[1], 1, 2)
+	} else {
+		colors[2] = interpolateColors(colors[0], colors[1], 1, 1)
+		colors[3] = color.RGBA{0, 0, 0, 0}
+	}
+
+	for j := 0; j < 4; j++ {
+		for i := 0; i < 4; i++ {
+			px := x + i
+			py := y + j
+			if px >= width {
+				continue
+			}
+
+			alphaCode := (alphaData >> uint(j*12+i*3)) & 0x7
+			var alpha uint8
+			switch alphaCode {
+			case 0:
+				alpha = alpha0
+			case 1:
+				alpha = alpha1
+			case 2:
+				if alpha0 > alpha1 {
+					alpha = (6*alpha0 + 1*alpha1) / 7
+				} else {
+					alpha = (4*alpha0 + 1*alpha1) / 5
+				}
+			case 3:
+				if alpha0 > alpha1 {
+					alpha = (5*alpha0 + 2*alpha1) / 7
+				} else {
+					alpha = (3*alpha0 + 2*alpha1) / 5
+				}
+			case 4:
+				if alpha0 > alpha1 {
+					alpha = (4*alpha0 + 3*alpha1) / 7
+				} else {
+					alpha = (2*alpha0 + 3*alpha1) / 5
+				}
+			case 5:
+				if alpha0 > alpha1 {
+					alpha = (3*alpha0 + 4*alpha1) / 7
+				} else {
+					alpha = (1*alpha0 + 4*alpha1) / 5
+				}
+			case 6:
+				if alpha0 > alpha1 {
+					alpha = (2*alpha0 + 5*alpha1) / 7
+				} else {
+					alpha = alpha1
+				}
+			case 7:
+				if alpha0 > alpha1 {
+					alpha = (1*alpha0 + 6*alpha1) / 7
+				} else {
+					alpha = alpha0
+				}
+			}
+
+			colorIndex := (colorData >> uint((j*4+i)*2)) & 0x3
+			color := colors[colorIndex]
+			color.A = alpha
+
+			img.Set(px, py, color)
+		}
+	}
 }
